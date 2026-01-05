@@ -1,6 +1,6 @@
 # frkr-streaming-gateway
 
-Streaming Gateway service for the frkr Traffic Mirroring Platform.
+Streaming Gateway service for frkr.
 
 ## Overview
 
