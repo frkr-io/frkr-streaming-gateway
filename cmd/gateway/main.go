@@ -10,78 +10,101 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/frkr-io/frkr-common/auth"
 	dbcommon "github.com/frkr-io/frkr-common/db"
+	"github.com/frkr-io/frkr-common/gateway"
 	"github.com/frkr-io/frkr-common/messages"
-	_ "github.com/lib/pq"
+	_ "github.com/lib/pq" // PostgreSQL driver registration
 	"github.com/segmentio/kafka-go"
 )
 
+const (
+	ServiceName = "frkr-streaming-gateway"
+	Version     = "0.1.0"
+)
+
 var (
-	httpPort    = flag.Int("http-port", 8081, "HTTP server port")
-	dbURL       = flag.String("db-url", "", "Postgres-compatible database connection URL")
-	brokerURL = flag.String("broker-url", "localhost:19092", "Kafka-compatible broker URL")
+	httpPort  = flag.Int("http-port", 8081, "HTTP server port")
+	dbURL     = flag.String("db-url", "", "Postgres-compatible database connection URL (required)")
+	brokerURL = flag.String("broker-url", "", "Broker URL (Kafka Protocol compliant, required)")
 )
 
 func main() {
 	flag.Parse()
 
-	// Check environment variables if flags not set
-	if *dbURL == "" {
-		*dbURL = os.Getenv("DB_URL")
-		if *dbURL == "" {
-			*dbURL = "postgres://root@localhost:26257/frkrdb?sslmode=disable"
-		}
+	// Load and validate configuration (12-factor app pattern)
+	cfg := &gateway.Config{
+		HTTPPort:  *httpPort,
+		DBURL:     *dbURL,
+		BrokerURL: *brokerURL,
 	}
+	gateway.MustLoadConfig(cfg)
 
-	if *brokerURL == "localhost:19092" {
-		if envURL := os.Getenv("BROKER_URL"); envURL != "" {
-			*brokerURL = envURL
-		}
-	}
-
-	if *httpPort == 8081 {
-		if envPort := os.Getenv("HTTP_PORT"); envPort != "" {
-			if port, err := strconv.Atoi(envPort); err == nil {
-				*httpPort = port
-			}
-		}
-	}
-
-	// Connect to database
-	if *dbURL == "" {
-		log.Fatal("DB_URL environment variable or flag is required")
-	}
-	db, err := sql.Open("postgres", *dbURL)
+	// Initialize database connection
+	db, err := sql.Open("postgres", cfg.DBURL)
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		log.Fatalf("Failed to open database connection: %v", err)
 	}
 	defer db.Close()
 
-	if err := db.Ping(); err != nil {
-		log.Fatalf("Failed to ping database: %v", err)
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	// Create health checker and start background health checks
+	healthChecker := gateway.NewHealthChecker(ServiceName, Version)
+	healthChecker.StartHealthCheckLoop(db, cfg.BrokerURL)
+
+	// Set up HTTP handlers
+	mux := http.NewServeMux()
+
+	// Register standard health endpoints from shared package
+	healthChecker.RegisterHealthEndpoints(mux, cfg.HTTPPort, cfg.DBURL, cfg.BrokerURL)
+
+	// Business endpoint
+	mux.HandleFunc("/stream", makeStreamHandler(db, cfg.BrokerURL, healthChecker))
+
+	// Start server
+	server := &http.Server{
+		Addr:    fmt.Sprintf(":%d", cfg.HTTPPort),
+		Handler: mux,
 	}
 
-	// Validate broker URL
-	if *brokerURL == "" || *brokerURL == "localhost:19092" {
-		if envURL := os.Getenv("BROKER_URL"); envURL == "" {
-			log.Fatal("BROKER_URL environment variable or flag is required")
+	go func() {
+		log.Printf("Starting %s v%s on port %d", ServiceName, Version, cfg.HTTPPort)
+		log.Printf("  Database: %s", gateway.SanitizeURL(cfg.DBURL))
+		log.Printf("  Broker:   %s", cfg.BrokerURL)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP server failed: %v", err)
 		}
-	}
+	}()
 
-	// HTTP handlers
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
+	// Wait for interrupt
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	<-sigChan
 
-	http.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
+	log.Println("Shutting down...")
+
+	// Graceful shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = server.Shutdown(ctx)
+}
+
+func makeStreamHandler(db *sql.DB, brokerURL string, hc *gateway.HealthChecker) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Check if we're ready
+		if !hc.IsReady() {
+			http.Error(w, "Service unavailable - dependencies not ready", http.StatusServiceUnavailable)
 			return
 		}
 
@@ -107,7 +130,7 @@ func main() {
 
 		// Create Kafka reader
 		reader := kafka.NewReader(kafka.ReaderConfig{
-			Brokers: []string{*brokerURL},
+			Brokers: []string{brokerURL},
 			Topic:   topic,
 			GroupID: fmt.Sprintf("streaming-gateway-%s", streamID),
 		})
@@ -139,32 +162,11 @@ func main() {
 
 				// Send as SSE
 				data, _ := json.Marshal(streamMsg)
-				fmt.Fprintf(w, "data: %s\n\n", data)
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()
 				}
 			}
 		}
-	})
-
-	// Start server
-	server := &http.Server{
-		Addr: fmt.Sprintf(":%d", *httpPort),
 	}
-
-	go func() {
-		log.Printf("Starting Streaming Gateway on port %d", *httpPort)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server failed: %v", err)
-		}
-	}()
-
-	// Wait for interrupt
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	<-sigChan
-
-	log.Println("Shutting down...")
-	server.Close()
 }
-
