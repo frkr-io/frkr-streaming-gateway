@@ -9,24 +9,24 @@ import (
 	"github.com/frkr-io/frkr-common/plugins"
 )
 
-// Server holds the gateway server dependencies
-type Server struct {
+// StreamingGatewayServer holds the gateway server dependencies
+type StreamingGatewayServer struct {
 	DB            *sql.DB
 	BrokerURL     string
-	HealthChecker *gateway.HealthChecker
+	HealthChecker *gateway.GatewayHealthChecker
 	AuthPlugin    plugins.AuthPlugin
 	SecretPlugin  plugins.SecretPlugin
 }
 
-// NewServer creates a new streaming gateway server
-func NewServer(
+// NewStreamingGatewayServer creates a new streaming gateway server
+func NewStreamingGatewayServer(
 	db *sql.DB,
 	brokerURL string,
-	healthChecker *gateway.HealthChecker,
+	healthChecker *gateway.GatewayHealthChecker,
 	authPlugin plugins.AuthPlugin,
 	secretPlugin plugins.SecretPlugin,
-) *Server {
-	return &Server{
+) *StreamingGatewayServer {
+	return &StreamingGatewayServer{
 		DB:            db,
 		BrokerURL:     brokerURL,
 		HealthChecker: healthChecker,
@@ -36,7 +36,7 @@ func NewServer(
 }
 
 // SetupHandlers registers all HTTP handlers on the provided mux
-func (s *Server) SetupHandlers(mux *http.ServeMux, cfg *gateway.Config) {
+func (s *StreamingGatewayServer) SetupHandlers(mux *http.ServeMux, cfg *gateway.GatewayBaseConfig) {
 	// Build URLs for health endpoints
 	var dbURL string
 	if cfg.DBURL != "" {

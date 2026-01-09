@@ -63,12 +63,12 @@ func TestStreamingGateway_AuthenticatedRequest(t *testing.T) {
 
 	authPlugin := plugins.NewBasicAuthPlugin(testDB)
 
-	healthChecker := gateway.NewHealthChecker("frkr-streaming-gateway", "0.1.0")
+	healthChecker := gateway.NewGatewayHealthChecker("frkr-streaming-gateway", "0.1.0")
 	healthChecker.CheckDependencies(testDB, "localhost:9092")
 
 	// Create server and get handler
-	srv := server.NewServer(testDB, "localhost:9092", healthChecker, authPlugin, secretPlugin)
-	cfg := &gateway.Config{
+	srv := server.NewStreamingGatewayServer(testDB, "localhost:9092", healthChecker, authPlugin, secretPlugin)
+	cfg := &gateway.GatewayBaseConfig{
 		HTTPPort: 8081,
 		DBURL:    "test",
 		BrokerURL: "localhost:9092",

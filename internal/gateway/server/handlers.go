@@ -15,7 +15,7 @@ import (
 )
 
 // StreamHandler handles GET /stream requests (SSE streaming)
-func (s *Server) StreamHandler() http.HandlerFunc {
+func (s *StreamingGatewayServer) StreamHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)

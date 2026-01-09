@@ -42,7 +42,7 @@ func NewStreamingGateway(authPlugin plugins.AuthPlugin, secretPlugin plugins.Sec
 }
 
 // Start starts the gateway server
-func (g *StreamingGateway) Start(cfg *gateway.Config, db *sql.DB) error {
+func (g *StreamingGateway) Start(cfg *gateway.GatewayBaseConfig, db *sql.DB) error {
 	// Build broker URL for health checks
 	var brokerURL string
 	if cfg.BrokerURL != "" {
@@ -76,11 +76,11 @@ func (g *StreamingGateway) Start(cfg *gateway.Config, db *sql.DB) error {
 	}
 
 	// Create health checker and start background health checks
-	healthChecker := gateway.NewHealthChecker(ServiceName, Version)
+	healthChecker := gateway.NewGatewayHealthChecker(ServiceName, Version)
 	healthChecker.StartHealthCheckLoop(db, brokerURL)
 
 	// Create and configure server with injected plugins
-	srv := server.NewServer(db, brokerURL, healthChecker, g.authPlugin, g.secretPlugin)
+	srv := server.NewStreamingGatewayServer(db, brokerURL, healthChecker, g.authPlugin, g.secretPlugin)
 
 	// Set up HTTP handlers
 	mux := http.NewServeMux()
