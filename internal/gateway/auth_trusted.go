@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/frkr-io/frkr-common/plugins"
@@ -23,10 +24,17 @@ func NewTrustedHeaderAuthPlugin(db *sql.DB) *TrustedHeaderAuthPlugin {
 }
 
 // ValidateRequest validates the request by decoding the JWT from Authorization header
-func (p *TrustedHeaderAuthPlugin) ValidateRequest(ctx context.Context, token string, tokenType plugins.TokenType, secretPlugin plugins.SecretPlugin) (*plugins.AuthResult, error) {
-	if tokenType != plugins.TokenTypeBearer {
-		return nil, fmt.Errorf("TrustedHeaderAuthPlugin requires bearer token, got: %s", tokenType)
+func (p *TrustedHeaderAuthPlugin) ValidateRequest(ctx context.Context, r *http.Request, secretPlugin plugins.SecretPlugin) (*plugins.AuthResult, error) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		return nil, fmt.Errorf("missing Authorization header")
 	}
+
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		return nil, fmt.Errorf("TrustedHeaderAuthPlugin requires bearer token")
+	}
+
+	token := strings.TrimPrefix(authHeader, "Bearer ")
 
 	// Token is "Bearer <jwt>"
 	// We assume Envoy has already validated the signature.
@@ -63,10 +71,17 @@ func (p *TrustedHeaderAuthPlugin) ValidateRequest(ctx context.Context, token str
 		ClientType: "oidc_user",
 		TenantID:   "default", 
 		Roles:      []string{"user"},
+		AuthSource: "oidc",
 	}, nil
 }
 
 // CanAccessStream checks if the user/client can access a specific stream
-func (p *TrustedHeaderAuthPlugin) CanAccessStream(ctx context.Context, userID string, streamID string, permission string) (bool, error) {
+func (p *TrustedHeaderAuthPlugin) CanAccessStream(ctx context.Context, authResult *plugins.AuthResult, streamID string, permission string) (bool, error) {
+	if authResult.AuthSource != "oidc" {
+		// Not our user
+		return false, fmt.Errorf("TrustedHeaderAuthPlugin cannot authorize user from source: %s", authResult.AuthSource)
+	}
+	// For trusted header/OIDC, we currently allow all access if authenticated (demo mode)
+	// In reality, we'd check claims or lookup user in DB.
 	return true, nil
 }
