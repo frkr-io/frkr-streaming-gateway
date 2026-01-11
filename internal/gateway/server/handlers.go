@@ -10,7 +10,7 @@ import (
 
 	dbcommon "github.com/frkr-io/frkr-common/db"
 	"github.com/frkr-io/frkr-common/gateway"
-	"github.com/frkr-io/frkr-common/messages"
+	streamingv1 "github.com/frkr-io/frkr-proto/go/streaming/v1"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -81,7 +81,7 @@ func (s *StreamingGatewayServer) StreamHandler() http.HandlerFunc {
 				}
 
 				// Parse message
-				var streamMsg messages.StreamMessage
+				var streamMsg streamingv1.StreamMessage
 				if err := json.Unmarshal(msg.Value, &streamMsg); err != nil {
 					log.Printf("Error parsing message: %v", err)
 					continue

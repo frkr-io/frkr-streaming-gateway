@@ -8,6 +8,7 @@ import (
 	"github.com/frkr-io/frkr-streaming-gateway/internal/gateway"
 )
 
+
 func main() {
 	cfg, err := gwcommon.LoadConfigFromFlags()
 	if err != nil {
