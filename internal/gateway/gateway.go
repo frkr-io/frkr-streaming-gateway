@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"net/http"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,12 +13,17 @@ import (
 
 	"github.com/frkr-io/frkr-common/gateway"
 	"github.com/frkr-io/frkr-common/plugins"
+	streamingv1 "github.com/frkr-io/frkr-proto/go/streaming/v1"
 	"github.com/frkr-io/frkr-streaming-gateway/internal/gateway/server"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/reflection"
 )
 
 const (
 	ServiceName = "frkr-streaming-gateway"
-	Version     = "0.1.0"
+	Version     = "0.2.0"
 )
 
 // StreamingGateway is the main gateway server
@@ -41,9 +46,9 @@ func NewStreamingGateway(authPlugin plugins.AuthPlugin, secretPlugin plugins.Sec
 	}, nil
 }
 
-// Start starts the gateway server
+// Start starts the gRPC gateway server
 func (g *StreamingGateway) Start(cfg *gateway.GatewayBaseConfig, db *sql.DB) error {
-	// Build broker URL for health checks
+	// Build broker URL
 	var brokerURL string
 	if cfg.BrokerURL != "" {
 		brokerURL = cfg.BrokerURL
@@ -55,49 +60,39 @@ func (g *StreamingGateway) Start(cfg *gateway.GatewayBaseConfig, db *sql.DB) err
 		brokerURL = fmt.Sprintf("%s:%s", cfg.BrokerHost, port)
 	}
 
-	// Build DB URL for health checks
-	var dbURL string
-	if cfg.DBURL != "" {
-		dbURL = cfg.DBURL
-	} else {
-		port := cfg.DBPort
-		if port == "" {
-			port = "26257"
-		}
-		if cfg.DBUser != "" {
-			if cfg.DBPassword != "" {
-				dbURL = fmt.Sprintf("postgres://%s:%s@%s:%s/%s", cfg.DBUser, cfg.DBPassword, cfg.DBHost, port, cfg.DBName)
-			} else {
-				dbURL = fmt.Sprintf("postgres://%s@%s:%s/%s", cfg.DBUser, cfg.DBHost, port, cfg.DBName)
-			}
-		} else {
-			dbURL = fmt.Sprintf("postgres://%s:%s/%s", cfg.DBHost, port, cfg.DBName)
-		}
-	}
+	// Create gRPC server with auth interceptors
+	grpcServer := grpc.NewServer(
+		grpc.UnaryInterceptor(server.UnaryAuthInterceptor(g.authPlugin, g.secretPlugin)),
+		grpc.StreamInterceptor(server.StreamAuthInterceptor(g.authPlugin, g.secretPlugin)),
+	)
 
-	// Create health checker and start background health checks
-	healthChecker := gateway.NewGatewayHealthChecker(ServiceName, Version)
-	healthChecker.StartHealthCheckLoop(db, brokerURL)
+	// Create and register the streaming service
+	streamingServer := server.NewStreamingGRPCServer(db, brokerURL, g.authPlugin, g.secretPlugin)
+	streamingv1.RegisterStreamingServiceServer(grpcServer, streamingServer)
 
-	// Create and configure server with injected plugins
-	srv := server.NewStreamingGatewayServer(db, brokerURL, healthChecker, g.authPlugin, g.secretPlugin)
+	// Register gRPC health checking
+	healthServer := health.NewServer()
+	grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
+	healthServer.SetServingStatus(ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
 
-	// Set up HTTP handlers
-	mux := http.NewServeMux()
-	srv.SetupHandlers(mux, cfg)
+	// Enable gRPC reflection for debugging
+	reflection.Register(grpcServer)
 
-	// Start server
-	httpServer := &http.Server{
-		Addr:    fmt.Sprintf(":%d", cfg.HTTPPort),
-		Handler: mux,
+	// Start background health checking for dependencies
+	go g.healthCheckLoop(db, brokerURL, healthServer)
+
+	// Start listening
+	addr := fmt.Sprintf(":%d", cfg.HTTPPort) // Reusing HTTPPort config for gRPC
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("failed to listen: %w", err)
 	}
 
 	go func() {
-		log.Printf("Starting %s v%s on port %d", ServiceName, Version, cfg.HTTPPort)
-		log.Printf("  Database: %s", gateway.SanitizeURL(dbURL))
-		log.Printf("  Broker:   %s", brokerURL)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server failed: %v", err)
+		log.Printf("Starting %s v%s (gRPC) on port %d", ServiceName, Version, cfg.HTTPPort)
+		log.Printf("  Broker: %s", brokerURL)
+		if err := grpcServer.Serve(listener); err != nil {
+			log.Fatalf("gRPC server failed: %v", err)
 		}
 	}()
 
@@ -109,12 +104,45 @@ func (g *StreamingGateway) Start(cfg *gateway.GatewayBaseConfig, db *sql.DB) err
 	log.Println("Shutting down...")
 
 	// Graceful shutdown
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	
-	if err := httpServer.Shutdown(ctx); err != nil {
-		return fmt.Errorf("failed to shutdown server: %w", err)
+	stopped := make(chan struct{})
+	go func() {
+		grpcServer.GracefulStop()
+		close(stopped)
+	}()
+
+	// Wait up to 10 seconds for graceful shutdown
+	select {
+	case <-stopped:
+		log.Println("Server stopped gracefully")
+	case <-time.After(10 * time.Second):
+		log.Println("Forcing shutdown...")
+		grpcServer.Stop()
 	}
 
 	return nil
+}
+
+// healthCheckLoop periodically checks dependencies and updates gRPC health status
+func (g *StreamingGateway) healthCheckLoop(db *sql.DB, brokerURL string, healthServer *health.Server) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		<-ticker.C
+
+		// Check database
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := db.PingContext(ctx)
+		cancel()
+
+		if err != nil {
+			log.Printf("Health check: database unhealthy: %v", err)
+			healthServer.SetServingStatus(ServiceName, grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+			continue
+		}
+
+		// TODO: Add Kafka health check if needed
+
+		healthServer.SetServingStatus(ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
+	}
 }

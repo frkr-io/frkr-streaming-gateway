@@ -75,6 +75,52 @@ func (p *TrustedHeaderAuthPlugin) ValidateRequest(ctx context.Context, r *http.R
 	}, nil
 }
 
+// ValidateAuthHeader validates the Authorization header directly (protocol-agnostic)
+func (p *TrustedHeaderAuthPlugin) ValidateAuthHeader(ctx context.Context, authHeader string, secretPlugin plugins.SecretPlugin) (*plugins.AuthResult, error) {
+	if authHeader == "" {
+		return nil, fmt.Errorf("missing Authorization header")
+	}
+
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		return nil, fmt.Errorf("TrustedHeaderAuthPlugin requires bearer token")
+	}
+
+	token := strings.TrimPrefix(authHeader, "Bearer ")
+
+	// Token is "Bearer <jwt>"
+	// We assume Envoy has already validated the signature.
+	// We just need to parse claims to get user/client identity.
+
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid JWT format")
+	}
+
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode JWT payload: %v", err)
+	}
+
+	var claims map[string]interface{}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal JWT claims: %v", err)
+	}
+
+	// Extract identity
+	var userID string
+	if sub, ok := claims["sub"].(string); ok {
+		userID = sub
+	}
+	
+	return &plugins.AuthResult{
+		UserID:     userID,
+		ClientType: "oidc_user",
+		TenantID:   "default", 
+		Roles:      []string{"user"},
+		AuthSource: "oidc",
+	}, nil
+}
+
 // CanAccessStream checks if the user/client can access a specific stream
 func (p *TrustedHeaderAuthPlugin) CanAccessStream(ctx context.Context, authResult *plugins.AuthResult, streamID string, permission string) (bool, error) {
 	if authResult.AuthSource != "oidc" {
