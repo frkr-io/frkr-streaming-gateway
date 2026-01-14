@@ -13,7 +13,6 @@ import (
 	"github.com/frkr-io/frkr-streaming-gateway/internal/gateway/server"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -21,20 +20,6 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// setupTestUserForGateway creates a test user in the database
-func setupTestUserForStreamingGateway(t *testing.T, dbConn *sql.DB, tenantID, username, password string) {
-	// Table creation is handled by migrations in SetupTestDB
-
-	passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	require.NoError(t, err)
-
-	_, err = dbConn.Exec(`
-		INSERT INTO users (tenant_id, username, password_hash)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (tenant_id, username) DO UPDATE SET password_hash = EXCLUDED.password_hash
-	`, tenantID, username, string(passwordHash))
-	require.NoError(t, err)
-}
 
 func startTestGRPCServer(t *testing.T, dbConn *sql.DB, authPlugin plugins.AuthPlugin, secretPlugin plugins.SecretPlugin, brokerURL string) (string, func()) {
 	lis, err := net.Listen("tcp", "localhost:0")
