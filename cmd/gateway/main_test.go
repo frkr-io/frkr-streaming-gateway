@@ -1,20 +1,24 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
-	"net/http"
-	"net/http/httptest"
+	"net"
 	"testing"
 
-	"github.com/frkr-io/frkr-streaming-gateway/internal/gateway/server"
-	"github.com/frkr-io/frkr-common/db"
 	dbcommon "github.com/frkr-io/frkr-common/db"
-	"github.com/frkr-io/frkr-common/gateway"
 	"github.com/frkr-io/frkr-common/plugins"
+	streamingv1 "github.com/frkr-io/frkr-proto/go/streaming/v1"
+	"github.com/frkr-io/frkr-streaming-gateway/internal/gateway/server"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // setupTestUserForGateway creates a test user in the database
@@ -44,8 +48,31 @@ func setupTestUserForStreamingGateway(t *testing.T, dbConn *sql.DB, tenantID, us
 	require.NoError(t, err)
 }
 
+func startTestGRPCServer(t *testing.T, dbConn *sql.DB, authPlugin plugins.AuthPlugin, secretPlugin plugins.SecretPlugin, brokerURL string) (string, func()) {
+	lis, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+
+	grpcServer := grpc.NewServer(
+		grpc.UnaryInterceptor(server.UnaryAuthInterceptor(authPlugin, secretPlugin)),
+		grpc.StreamInterceptor(server.StreamAuthInterceptor(authPlugin, secretPlugin)),
+	)
+
+	srv := server.NewStreamingGRPCServer(dbConn, brokerURL, authPlugin, secretPlugin)
+	streamingv1.RegisterStreamingServiceServer(grpcServer, srv)
+
+	go func() {
+		if err := grpcServer.Serve(lis); err != nil {
+			// Expected on stop
+		}
+	}()
+
+	return lis.Addr().String(), func() {
+		grpcServer.Stop()
+	}
+}
+
 func TestStreamingGateway_AuthenticatedRequest(t *testing.T) {
-	testDB, _ := db.SetupTestDB(t, "../../../frkr-common/migrations")
+	testDB, _ := dbcommon.SetupTestDB(t, "../../../frkr-common/migrations")
 
 	// Create tenant and user
 	tenant, err := dbcommon.CreateOrGetTenant(testDB, "test-tenant-streaming")
@@ -54,7 +81,7 @@ func TestStreamingGateway_AuthenticatedRequest(t *testing.T) {
 	setupTestUserForStreamingGateway(t, testDB, tenant.ID, "streamuser", "streampass123")
 
 	// Create stream
-	stream, err := dbcommon.CreateStream(testDB, tenant.ID, "test-stream", "Test stream", 7)
+	_, err = dbcommon.CreateStream(testDB, tenant.ID, "test-stream", "Test stream", 7)
 	require.NoError(t, err)
 
 	// Initialize plugins
@@ -63,81 +90,73 @@ func TestStreamingGateway_AuthenticatedRequest(t *testing.T) {
 
 	authPlugin := plugins.NewBasicAuthPlugin(testDB)
 
-	healthChecker := gateway.NewGatewayHealthChecker("frkr-streaming-gateway", "0.1.0")
-	healthChecker.CheckDependencies(testDB, "localhost:9092")
+	// Start gRPC server
+	addr, cleanup := startTestGRPCServer(t, testDB, authPlugin, secretPlugin, "localhost:9092")
+	defer cleanup()
 
-	// Create server and get handler
-	srv := server.NewStreamingGatewayServer(testDB, "localhost:9092", healthChecker, authPlugin, secretPlugin)
-	cfg := &gateway.GatewayBaseConfig{
-		HTTPPort: 8081,
-		DBURL:    "test",
-		BrokerURL: "localhost:9092",
-	}
-	mux := http.NewServeMux()
-	srv.SetupHandlers(mux, cfg)
-	handler := mux.ServeHTTP
+	// Connect client
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	defer conn.Close()
 
-	t.Run("successful authenticated request - auth passes before Kafka read", func(t *testing.T) {
-		t.Skip("Skipping blocking SSE test - requires Kafka testcontainers")
+	client := streamingv1.NewStreamingServiceClient(conn)
+
+	t.Run("successful authenticated request", func(t *testing.T) {
+		creds := base64.StdEncoding.EncodeToString([]byte("streamuser:streampass123"))
+		ctx := metadata.AppendToOutgoingContext(context.Background(), "authorization", "Basic "+creds)
+
+		// ListStreams uses UnaryInterceptor and logic similar to OpenStream for auth
+		resp, err := client.ListStreams(ctx, &streamingv1.ListStreamsRequest{})
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		
+		// We expect at least the stream we created
+		found := false
+		for _, s := range resp.Streams {
+			if s.Name == "test-stream" {
+				found = true
+				break
+			}
+		}
+		assert.True(t, found, "test-stream should be returned")
 	})
 
 	t.Run("unauthorized - missing auth header", func(t *testing.T) {
-		req := httptest.NewRequest("GET", "/stream?stream_id="+stream.Name, nil)
-		w := httptest.NewRecorder()
-
-		handler(w, req)
-
-		assert.Equal(t, http.StatusUnauthorized, w.Code)
+		_, err := client.ListStreams(context.Background(), &streamingv1.ListStreamsRequest{})
+		require.Error(t, err)
+		st, ok := status.FromError(err)
+		require.True(t, ok)
+		assert.Equal(t, codes.Unauthenticated, st.Code())
 	})
 
 	t.Run("unauthorized - invalid credentials", func(t *testing.T) {
-		req := httptest.NewRequest("GET", "/stream?stream_id="+stream.Name, nil)
-		credentials := base64.StdEncoding.EncodeToString([]byte("streamuser:wrongpass"))
-		req.Header.Set("Authorization", "Basic "+credentials)
+		creds := base64.StdEncoding.EncodeToString([]byte("streamuser:wrongpass"))
+		ctx := metadata.AppendToOutgoingContext(context.Background(), "authorization", "Basic "+creds)
 
-		w := httptest.NewRecorder()
-		handler(w, req)
-
-		assert.Equal(t, http.StatusUnauthorized, w.Code)
+		_, err := client.ListStreams(ctx, &streamingv1.ListStreamsRequest{})
+		require.Error(t, err)
+		st, ok := status.FromError(err)
+		require.True(t, ok)
+		assert.Equal(t, codes.Unauthenticated, st.Code())
 	})
 
-	t.Run("missing stream_id parameter", func(t *testing.T) {
-		req := httptest.NewRequest("GET", "/stream", nil)
-		credentials := base64.StdEncoding.EncodeToString([]byte("streamuser:streampass123"))
-		req.Header.Set("Authorization", "Basic "+credentials)
-
-		w := httptest.NewRecorder()
-		handler(w, req)
-
-		assert.Equal(t, http.StatusBadRequest, w.Code)
-	})
-
-	t.Run("unauthorized - wrong tenant", func(t *testing.T) {
-		// Create another tenant and stream
+    t.Run("unauthorized - wrong tenant", func(t *testing.T) {
+		// Create another tenant and user
 		otherTenant, err := dbcommon.CreateOrGetTenant(testDB, "other-tenant-streaming")
 		require.NoError(t, err)
+        setupTestUserForStreamingGateway(t, testDB, otherTenant.ID, "otheruser", "otherpass123")
+		
+		creds := base64.StdEncoding.EncodeToString([]byte("otheruser:otherpass123"))
+		ctx := metadata.AppendToOutgoingContext(context.Background(), "authorization", "Basic "+creds)
 
-		otherStream, err := dbcommon.CreateStream(testDB, otherTenant.ID, "other-stream", "Other", 7)
+		resp, err := client.ListStreams(ctx, &streamingv1.ListStreamsRequest{})
 		require.NoError(t, err)
-
-		req := httptest.NewRequest("GET", "/stream?stream_id="+otherStream.Name, nil)
-		credentials := base64.StdEncoding.EncodeToString([]byte("streamuser:streampass123"))
-		req.Header.Set("Authorization", "Basic "+credentials)
-
-		w := httptest.NewRecorder()
-		handler(w, req)
-
-		assert.Equal(t, http.StatusUnauthorized, w.Code)
-	})
-
-	t.Run("method not allowed", func(t *testing.T) {
-		req := httptest.NewRequest("POST", "/stream?stream_id="+stream.Name, nil)
-		credentials := base64.StdEncoding.EncodeToString([]byte("streamuser:streampass123"))
-		req.Header.Set("Authorization", "Basic "+credentials)
-
-		w := httptest.NewRecorder()
-		handler(w, req)
-
-		assert.Equal(t, http.StatusMethodNotAllowed, w.Code)
+		
+        // Other user should NOT see streams from first tenant
+		for _, s := range resp.Streams {
+			if s.Name == "test-stream" {
+				assert.Fail(t, "Should not see stream from another tenant")
+			}
+		}
 	})
 }
