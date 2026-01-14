@@ -23,19 +23,7 @@ import (
 
 // setupTestUserForGateway creates a test user in the database
 func setupTestUserForStreamingGateway(t *testing.T, dbConn *sql.DB, tenantID, username, password string) {
-	_, err := dbConn.Exec(`
-		CREATE TABLE IF NOT EXISTS users (
-			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-			tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-			username STRING(255) NOT NULL,
-			password_hash STRING(255) NOT NULL,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			deleted_at TIMESTAMPTZ,
-			UNIQUE (tenant_id, username)
-		)
-	`)
-	require.NoError(t, err)
+	// Table creation is handled by migrations in SetupTestDB
 
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	require.NoError(t, err)
@@ -78,7 +66,8 @@ func TestStreamingGateway_AuthenticatedRequest(t *testing.T) {
 	tenant, err := dbcommon.CreateOrGetTenant(testDB, "test-tenant-streaming")
 	require.NoError(t, err)
 
-	setupTestUserForStreamingGateway(t, testDB, tenant.ID, "streamuser", "streampass123")
+	_, err = dbcommon.CreateUser(testDB, tenant.ID, "streamuser", "streampass123")
+	require.NoError(t, err)
 
 	// Create stream
 	_, err = dbcommon.CreateStream(testDB, tenant.ID, "test-stream", "Test stream", 7)
@@ -144,7 +133,8 @@ func TestStreamingGateway_AuthenticatedRequest(t *testing.T) {
 		// Create another tenant and user
 		otherTenant, err := dbcommon.CreateOrGetTenant(testDB, "other-tenant-streaming")
 		require.NoError(t, err)
-        setupTestUserForStreamingGateway(t, testDB, otherTenant.ID, "otheruser", "otherpass123")
+        _, err = dbcommon.CreateUser(testDB, otherTenant.ID, "otheruser", "otherpass123")
+		require.NoError(t, err)
 		
 		creds := base64.StdEncoding.EncodeToString([]byte("otheruser:otherpass123"))
 		ctx := metadata.AppendToOutgoingContext(context.Background(), "authorization", "Basic "+creds)
