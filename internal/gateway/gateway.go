@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/frkr-io/frkr-common/gateway"
+	"github.com/frkr-io/frkr-common/metrics"
 	"github.com/frkr-io/frkr-common/plugins"
 	streamingv1 "github.com/frkr-io/frkr-proto/go/streaming/v1"
 	"github.com/frkr-io/frkr-streaming-gateway/internal/gateway/server"
@@ -40,6 +42,11 @@ func NewStreamingGateway(authPlugin plugins.AuthPlugin, secretPlugin plugins.Sec
 	if secretPlugin == nil {
 		return nil, fmt.Errorf("secretPlugin cannot be nil")
 	}
+
+	// Register streaming-specific metrics
+	metrics.RegisterStreamingMetrics()
+	metrics.SetServiceInfo(ServiceName, Version)
+
 	return &StreamingGateway{
 		authPlugin:   authPlugin,
 		secretPlugin: secretPlugin,
@@ -81,7 +88,7 @@ func (g *StreamingGateway) Start(cfg *gateway.GatewayBaseConfig, db *sql.DB) err
 	// Start background health checking for dependencies
 	go g.healthCheckLoop(db, brokerURL, healthServer)
 
-	// Start listening
+	// Start gRPC server
 	addr := fmt.Sprintf(":%d", cfg.HTTPPort) // Reusing HTTPPort config for gRPC
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -93,6 +100,27 @@ func (g *StreamingGateway) Start(cfg *gateway.GatewayBaseConfig, db *sql.DB) err
 		log.Printf("  Broker: %s", brokerURL)
 		if err := grpcServer.Serve(listener); err != nil {
 			log.Fatalf("gRPC server failed: %v", err)
+		}
+	}()
+
+	// Start HTTP server for /metrics on a separate port (cfg.HTTPPort + 1000)
+	metricsPort := cfg.HTTPPort + 1000
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", metrics.Handler())
+	metricsMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+
+	metricsServer := &http.Server{
+		Addr:    fmt.Sprintf(":%d", metricsPort),
+		Handler: metricsMux,
+	}
+
+	go func() {
+		log.Printf("Starting metrics server on port %d", metricsPort)
+		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("Metrics server failed: %v", err)
 		}
 	}()
 
@@ -109,6 +137,11 @@ func (g *StreamingGateway) Start(cfg *gateway.GatewayBaseConfig, db *sql.DB) err
 		grpcServer.GracefulStop()
 		close(stopped)
 	}()
+
+	// Shutdown metrics server
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	metricsServer.Shutdown(shutdownCtx)
 
 	// Wait up to 10 seconds for graceful shutdown
 	select {
@@ -138,11 +171,14 @@ func (g *StreamingGateway) healthCheckLoop(db *sql.DB, brokerURL string, healthS
 		if err != nil {
 			log.Printf("Health check: database unhealthy: %v", err)
 			healthServer.SetServingStatus(ServiceName, grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+			metrics.SetUnhealthy()
 			continue
 		}
 
 		// TODO: Add Kafka health check if needed
 
 		healthServer.SetServingStatus(ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
+		metrics.SetHealthy()
 	}
 }
+

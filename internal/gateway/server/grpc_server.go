@@ -9,6 +9,7 @@ import (
 	"time"
 
 	dbcommon "github.com/frkr-io/frkr-common/db"
+	"github.com/frkr-io/frkr-common/metrics"
 	"github.com/frkr-io/frkr-common/plugins"
 	streamingv1 "github.com/frkr-io/frkr-proto/go/streaming/v1"
 	"github.com/segmentio/kafka-go"
@@ -90,10 +91,19 @@ func (s *StreamingGRPCServer) ListStreams(ctx context.Context, req *streamingv1.
 // OpenStream opens a stream and sends messages to the client
 func (s *StreamingGRPCServer) OpenStream(req *streamingv1.OpenStreamRequest, stream streamingv1.StreamingService_OpenStreamServer) error {
 	ctx := stream.Context()
+	startTime := time.Now()
+
+	// Track stream open/close
+	metrics.RecordStreamOpened()
+	defer func() {
+		metrics.RecordStreamClosed()
+		metrics.RecordStreamDuration(req.StreamId, time.Since(startTime).Seconds())
+	}()
 
 	// Get auth result from context (set by interceptor)
 	authResult, ok := AuthFromContext(ctx)
 	if !ok {
+		metrics.RecordAuthFailure("frkr-streaming-gateway", "missing_context")
 		return status.Error(codes.Unauthenticated, "not authenticated")
 	}
 
@@ -109,6 +119,7 @@ func (s *StreamingGRPCServer) OpenStream(req *streamingv1.OpenStreamRequest, str
 		return status.Error(codes.Internal, "authorization check failed")
 	}
 	if !allowed {
+		metrics.RecordAuthFailure("frkr-streaming-gateway", "access_denied")
 		return status.Error(codes.PermissionDenied, "access denied to stream")
 	}
 
@@ -157,6 +168,10 @@ func (s *StreamingGRPCServer) OpenStream(req *streamingv1.OpenStreamRequest, str
 				log.Printf("Error sending message to client: %v", err)
 				return err
 			}
+
+			// Record message delivered
+			metrics.RecordMessageDelivered(streamID)
 		}
 	}
 }
+
