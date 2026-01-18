@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"log"
 	"time"
 
@@ -123,23 +122,67 @@ func (s *StreamingGRPCServer) OpenStream(req *streamingv1.OpenStreamRequest, str
 		return status.Error(codes.PermissionDenied, "access denied to stream")
 	}
 
-	// Get stream topic from database
-	topic, err := dbcommon.GetStreamTopic(s.DB, streamID)
+	// Get stream details from database (need retention days)
+	streamDetails, err := dbcommon.GetStream(s.DB, authResult.TenantID, streamID)
 	if err != nil {
 		return status.Error(codes.NotFound, "stream not found")
 	}
+	topic := streamDetails.Topic
 
-	log.Printf("Opening stream %s (topic: %s) for user %s", streamID, topic, authResult.UserID)
+	// Parse Replay timestamps
+	var replayFrom, replayTo time.Time
+	if req.ReplayFrom != nil {
+		replayFrom = req.ReplayFrom.AsTime()
+	}
+	if req.ReplayTo != nil {
+		replayTo = req.ReplayTo.AsTime()
+	}
 
-	// Create Kafka reader
-	reader := kafka.NewReader(kafka.ReaderConfig{
+	// Validate Retention
+	if !replayFrom.IsZero() {
+		retentionCutoff := time.Now().Add(time.Duration(-streamDetails.RetentionDays) * 24 * time.Hour)
+		if replayFrom.Before(retentionCutoff) {
+			return status.Errorf(codes.InvalidArgument, "requested replay start time is beyond retention period (%d days)", streamDetails.RetentionDays)
+		}
+	}
+
+	// Validate Replay Range
+	if !replayFrom.IsZero() && !replayTo.IsZero() {
+		if !replayTo.After(replayFrom) {
+			return status.Errorf(codes.InvalidArgument, "replay_to must be after replay_from")
+		}
+	}
+
+	log.Printf("Opening stream %s (topic: %s) for user %s. ReplayFrom: %v, ReplayTo: %v", streamID, topic, authResult.UserID, replayFrom, replayTo)
+
+	// Configure Kafka Reader
+	// We do NOT use GroupID here to avoid rebalancing storms for ephemeral CLI connections.
+	// Independent readers scale better for this use case.
+	readerConfig := kafka.ReaderConfig{
 		Brokers: []string{s.BrokerURL},
 		Topic:   topic,
-		GroupID: fmt.Sprintf("streaming-gateway-%s-%d", streamID, time.Now().UnixNano()),
-	})
+	}
+
+	if replayFrom.IsZero() {
+		// Default to live tail
+		readerConfig.StartOffset = kafka.LastOffset
+	}
+
+	reader := kafka.NewReader(readerConfig)
 	defer reader.Close()
 
+	if !replayFrom.IsZero() {
+		// Seek to specific timestamp
+		if err := reader.SetOffsetAt(ctx, replayFrom); err != nil {
+			log.Printf("Failed to set offset at %v: %v", replayFrom, err)
+			return status.Error(codes.Internal, "failed to start replay")
+		}
+	}
+
 	// Stream messages
+	retries := 0
+	const maxRetries = 5
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -151,9 +194,23 @@ func (s *StreamingGRPCServer) OpenStream(req *streamingv1.OpenStreamRequest, str
 				if ctx.Err() != nil {
 					return nil // Client disconnected
 				}
-				log.Printf("Error reading message from Kafka: %v", err)
+				
+				retries++
+				if retries > maxRetries {
+					log.Printf("Too many errors reading from Kafka (%d): %v. Closing stream %s", retries, err, streamID)
+					return status.Error(codes.Unavailable, "failed to read from event stream")
+				}
+
+				log.Printf("Error reading message from Kafka: %v (retry %d/%d)", err, retries, maxRetries)
 				time.Sleep(1 * time.Second)
 				continue
+			}
+			retries = 0 // Reset retries on success success
+
+			// Check if we passed the end timestamp
+			if !replayTo.IsZero() && msg.Time.After(replayTo) {
+				log.Printf("Replay finished for stream %s (reached %v)", streamID, replayTo)
+				return nil
 			}
 
 			// Parse message
